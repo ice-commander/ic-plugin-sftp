@@ -1,0 +1,20 @@
+[package]
+name = "ic-sftp-fs"
+version = "0.1.0"
+edition = "2021"
+description = "Declares the SFTP connection kind and the form the host renders for it"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ic-plugin-api = { workspace = true }
+ssh2 = { version = "0.9.5", features = ["vendored-openssl"] }
+serde_json = { workspace = true }
+dirs = "6.0.0"
+
+[features]
+default = ["export-abi"]
+export-abi = []

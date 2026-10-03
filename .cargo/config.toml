@@ -1,0 +1,5 @@
+# Build artefacts live under bin/, which is the one directory the repository
+# ignores. Without this they land in target/ at the root, where the next
+# `git add .` picks up several hundred megabytes of them.
+[build]
+target-dir = "bin/target"

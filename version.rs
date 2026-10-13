@@ -4,6 +4,6 @@
 // is what the C ABI hands back from ic_plugin_version.
 macro_rules! plugins_version {
     () => {
-        "0.1.0"
+        "0.1.1"
     };
 }

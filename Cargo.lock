@@ -54,7 +54,7 @@ checksum = "aedcfb3409746eddb02b9e19ebda1c3394f759a152e48ee875a0844d1b955484"
 [[package]]
 name = "ic-plugin-api"
 version = "0.1.0"
-source = "git+https://github.com/ice-commander/plugin-api.git?branch=main#c576bba71f972bea95bf77d9eca587e1afe9db70"
+source = "git+https://github.com/ice-commander/plugin-api.git?branch=main#1fca3a08bcedf194e20a7a0d01963e7a7aeb8a64"
 
 [[package]]
 name = "ic-sftp-fs"

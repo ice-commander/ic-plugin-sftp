@@ -25,30 +25,6 @@ pub fn starts_in(cwd: &str) -> &str {
     }
 }
 
-fn authenticate(session: &ssh2::Session, cfg: &Config) -> Result<(), String> {
-    if let Some(key) = cfg.key_path.as_deref().filter(|k| !k.is_empty()) {
-        session
-            .userauth_pubkey_file(
-                &cfg.user,
-                None,
-                std::path::Path::new(key),
-                cfg.passphrase.as_deref().filter(|p| !p.is_empty()),
-            )
-            .map_err(|e| format!("key authentication failed: {e}"))?;
-    } else if let Some(pass) = cfg.pass.as_deref() {
-        session
-            .userauth_password(&cfg.user, pass)
-            .map_err(|e| format!("password authentication failed: {e}"))?;
-    } else {
-        return Err("no stored credentials for this connection".to_string());
-    }
-    if session.authenticated() {
-        Ok(())
-    } else {
-        Err("authentication failed".to_string())
-    }
-}
-
 fn write_all(channel: &mut ssh2::Channel, data: &[u8]) -> bool {
     let mut sent = 0;
     while sent < data.len() {
@@ -80,7 +56,7 @@ fn run(
     session
         .handshake()
         .map_err(|e| format!("ssh handshake failed: {e}"))?;
-    authenticate(&session, cfg)?;
+    crate::ssh::authenticate(&session, cfg)?;
 
     let mut channel = session
         .channel_session()

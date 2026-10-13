@@ -9,6 +9,10 @@ use ic_plugin_api::{
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
 
+pub(crate) fn note(what: &str, why: impl std::fmt::Display) {
+    eprintln!("[ic-sftp] {what}: {why}");
+}
+
 pub const KIND: &str = "sftp";
 pub const DOCUMENT: &str = include_str!("../documents/sftp.json");
 pub const ID: &str = "ic-sftp-fs";

@@ -141,7 +141,10 @@ pub fn ensure_tunnel_helper(
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(ACCEPT_POLL)
                 }
-                Err(_) => break,
+                Err(e) => {
+                    crate::note("tunnel listener stopped", e);
+                    break;
+                }
             }
         }
     });
@@ -159,6 +162,12 @@ fn transport_lost(e: &ssh2::Error) -> bool {
     )
 }
 
+// A non-blocking libssh2 read answers 0 both at the end and when it has nothing yet.
+fn at_end(sess_c: &Mutex<ssh2::Session>, channel: &ssh2::Channel) -> bool {
+    let _sess_lock = sess_c.lock().unwrap_or_else(|e| e.into_inner());
+    channel.eof()
+}
+
 fn pump(
     mut std_stream: TcpStream,
     target_host: &str,
@@ -174,7 +183,12 @@ fn pump(
         match ch_res {
             Ok(ch) => ch,
             Err(e) => {
+                crate::note(
+                    &format!("tunnel could not open a channel to {target_host}:{target_port}"),
+                    &e,
+                );
                 if !sess_lock.authenticated() || transport_lost(&e) {
+                    crate::note("tunnel", "the jump host connection is gone, it will be reopened");
                     drop(sess_lock);
                     if let Some(tunnel) = tunnel_c.upgrade() {
                         *tunnel.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -193,6 +207,7 @@ fn pump(
     let mut tcp_len = 0;
     let mut ssh_offset = 0;
     let mut ssh_len = 0;
+    let mut heard = false;
 
     loop {
         let mut progressed = false;
@@ -206,7 +221,10 @@ fn pump(
                     progressed = true;
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(_) => break,
+                Err(e) => {
+                    crate::note("tunnel, reading the local side", e);
+                    break;
+                }
             }
         }
 
@@ -222,7 +240,10 @@ fn pump(
                     progressed = true;
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(_) => break,
+                Err(e) => {
+                    crate::note("tunnel, writing to the jump host", e);
+                    break;
+                }
             }
         }
 
@@ -232,14 +253,27 @@ fn pump(
                 channel.read(&mut buf_ssh)
             };
             match read_res {
-                Ok(0) => break,
+                Ok(0) if !at_end(sess_c, &channel) => {}
+                Ok(0) => {
+                    if !heard {
+                        crate::note(
+                            &format!("tunnel to {target_host}:{target_port}"),
+                            "the far side closed the connection before sending anything",
+                        );
+                    }
+                    break;
+                }
                 Ok(n) => {
+                    heard = true;
                     ssh_len = n;
                     ssh_offset = 0;
                     progressed = true;
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(_) => break,
+                Err(e) => {
+                    crate::note("tunnel, reading from the jump host", e);
+                    break;
+                }
             }
         }
 
@@ -251,7 +285,10 @@ fn pump(
                     progressed = true;
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(_) => break,
+                Err(e) => {
+                    crate::note("tunnel, writing to the local side", e);
+                    break;
+                }
             }
         }
 

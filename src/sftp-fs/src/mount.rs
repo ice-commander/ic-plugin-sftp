@@ -14,6 +14,7 @@ struct Mounted {
     entries: Vec<IcDirEntry>,
     body: Vec<u8>,
     failure: Option<CString>,
+    said: Option<CString>,
 }
 
 impl Mounted {
@@ -70,13 +71,19 @@ fn tunnel_of(settings: &serde_json::Value) -> Option<TunnelConfig> {
 
 pub extern "C" fn open(bytes: *const u8, len: u64, _user_data: *mut c_void) -> IcFsHandle {
     if bytes.is_null() || len == 0 {
+        crate::note("open", "the host passed no connection settings");
         return std::ptr::null_mut();
     }
     let encoded = unsafe { std::slice::from_raw_parts(bytes, len as usize) };
-    let Ok(settings) = serde_json::from_slice::<serde_json::Value>(encoded) else {
-        return std::ptr::null_mut();
+    let settings = match serde_json::from_slice::<serde_json::Value>(encoded) {
+        Ok(settings) => settings,
+        Err(e) => {
+            crate::note("open", format_args!("the connection settings are not valid JSON ({e})"));
+            return std::ptr::null_mut();
+        }
     };
     let Some(host) = text_of(&settings, "host") else {
+        crate::note("open", "the connection settings have no host");
         return std::ptr::null_mut();
     };
     let cfg = ssh::Config {
@@ -96,6 +103,7 @@ pub extern "C" fn open(bytes: *const u8, len: u64, _user_data: *mut c_void) -> I
         entries: Vec::new(),
         body: Vec::new(),
         failure: None,
+        said: None,
     })) as IcFsHandle
 }
 
@@ -137,6 +145,7 @@ pub extern "C" fn list(handle: IcFsHandle, path: *const c_char) -> IcListing {
                 }
             }
             Err(reason) => {
+                crate::note(&format!("list {path}"), &reason);
                 mounted.remember(reason);
                 IcListing::EMPTY
             }
@@ -157,6 +166,7 @@ pub extern "C" fn read(handle: IcFsHandle, path: *const c_char) -> IcBytes {
                 }
             }
             Err(reason) => {
+                crate::note(&format!("read {path}"), &reason);
                 mounted.remember(reason);
                 IcBytes::EMPTY
             }
@@ -171,8 +181,9 @@ pub extern "C" fn is_read_only(_handle: IcFsHandle) -> c_int {
 
 pub extern "C" fn last_error(handle: IcFsHandle) -> *const c_char {
     held(handle, |mounted| {
+        mounted.said = mounted.failure.take();
         mounted
-            .failure
+            .said
             .as_ref()
             .map(|text| text.as_ptr())
             .unwrap_or(std::ptr::null())
@@ -180,10 +191,11 @@ pub extern "C" fn last_error(handle: IcFsHandle) -> *const c_char {
     .unwrap_or(std::ptr::null())
 }
 
-fn reported(handle: IcFsHandle, outcome: Option<Result<(), String>>) -> c_int {
+fn reported(handle: IcFsHandle, op: &str, outcome: Option<Result<(), String>>) -> c_int {
     match outcome.unwrap_or_else(|| Err("no connection".to_string())) {
         Ok(()) => IC_OK,
         Err(reason) => {
+            crate::note(op, &reason);
             let _ = held(handle, |mounted| mounted.remember(reason));
             IC_ERR_INIT_FAILED
         }
@@ -205,7 +217,7 @@ pub extern "C" fn write(
     let outcome = held(handle, |mounted| {
         mounted.mount.with(|session| session.write(&path, &body))
     });
-    reported(handle, outcome)
+    reported(handle, &format!("write {path}"), outcome)
 }
 
 pub extern "C" fn create_dir(handle: IcFsHandle, path: *const c_char) -> c_int {
@@ -213,7 +225,7 @@ pub extern "C" fn create_dir(handle: IcFsHandle, path: *const c_char) -> c_int {
     let outcome = held(handle, |mounted| {
         mounted.mount.with(|session| session.create_dir(&path))
     });
-    reported(handle, outcome)
+    reported(handle, &format!("create folder {path}"), outcome)
 }
 
 pub extern "C" fn remove(handle: IcFsHandle, path: *const c_char) -> c_int {
@@ -221,7 +233,7 @@ pub extern "C" fn remove(handle: IcFsHandle, path: *const c_char) -> c_int {
     let outcome = held(handle, |mounted| {
         mounted.mount.with(|session| session.remove(&path))
     });
-    reported(handle, outcome)
+    reported(handle, &format!("remove {path}"), outcome)
 }
 
 pub extern "C" fn rename(handle: IcFsHandle, from: *const c_char, to: *const c_char) -> c_int {
@@ -229,7 +241,7 @@ pub extern "C" fn rename(handle: IcFsHandle, from: *const c_char, to: *const c_c
     let outcome = held(handle, |mounted| {
         mounted.mount.with(|session| session.rename(&from, &to))
     });
-    reported(handle, outcome)
+    reported(handle, &format!("rename {from} -> {to}"), outcome)
 }
 
 pub extern "C" fn set_permissions(handle: IcFsHandle, path: *const c_char, mode: u32) -> c_int {
@@ -239,7 +251,7 @@ pub extern "C" fn set_permissions(handle: IcFsHandle, path: *const c_char, mode:
             .mount
             .with(|session| session.set_permissions(&path, mode))
     });
-    reported(handle, outcome)
+    reported(handle, &format!("chmod {mode:o} {path}"), outcome)
 }
 
 pub extern "C" fn shell_open(
@@ -451,6 +463,54 @@ mod tests {
             assert_eq!(failure_of(handle), said);
             close(handle);
         }
+    }
+
+    fn closed_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    #[test]
+    fn a_server_that_refuses_the_connection_is_reported_not_listed_as_empty() {
+        let settings = serde_json::json!({
+            "host": "127.0.0.1",
+            "port": closed_port().to_string(),
+            "user": "nobody",
+            "pass": "never-sent",
+        })
+        .to_string();
+        let handle = opened(&settings);
+        assert_eq!(list(handle, c"/".as_ptr()).count, 0);
+        let why = failure_of(handle);
+        assert!(why.starts_with("TCP Connect:"), "got {why}");
+        assert!(!why.contains("never-sent"), "the password leaked into the reason");
+        close(handle);
+    }
+
+    #[test]
+    fn a_jump_host_that_refuses_the_connection_is_reported_with_its_own_reason() {
+        let settings = serde_json::json!({
+            "host": "10.255.255.1",
+            "port": "22",
+            "user": "nobody",
+            "pass": "never-sent",
+            "use_tunnel": "true",
+            "tunnel_host": "127.0.0.1",
+            "tunnel_port": closed_port().to_string(),
+            "tunnel_user": "jump",
+            "tunnel_auth_type": "password",
+            "tunnel_pass": "also-never-sent",
+        })
+        .to_string();
+        let handle = opened(&settings);
+        assert_eq!(list(handle, c"/".as_ptr()).count, 0);
+        let why = failure_of(handle);
+        assert!(why.starts_with("Tunnel TCP connect error:"), "got {why}");
+        assert!(!why.contains("never-sent"), "a password leaked into the reason");
+        close(handle);
     }
 
     #[test]
@@ -783,5 +843,22 @@ mod tests {
     #[ignore = "needs IC_SFTP_E2E_HOME holding docs/inner/file.txt that reads ic-sftp-e2e, behind a jump host"]
     fn a_tunnelled_mount_walks_the_server_by_its_own_paths() {
         walks_the_server_by_its_own_paths(true);
+    }
+
+    #[test]
+    fn a_failure_is_handed_over_once_and_then_forgotten() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let settings = format!(r#"{{"host":"127.0.0.1","port":"{port}","user":"nobody","pass":"never-sent"}}"#);
+        let handle = open(settings.as_ptr(), settings.len() as u64, std::ptr::null_mut());
+        assert!(!handle.is_null());
+        assert!(last_error(handle).is_null(), "nothing has failed yet");
+        assert_eq!(list(handle, c"/".as_ptr()).count, 0);
+        assert!(!last_error(handle).is_null(), "the failed listing gave no reason");
+        assert!(last_error(handle).is_null(), "the same failure was reported twice");
+        close(handle);
     }
 }

@@ -37,6 +37,37 @@ pub(crate) fn expand_tilde(path: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(path)
 }
 
+pub(crate) fn key_file(cfg: &Config) -> Option<std::path::PathBuf> {
+    cfg.key_path
+        .as_deref()
+        .filter(|k| !k.is_empty())
+        .map(expand_tilde)
+}
+
+pub(crate) fn authenticate(session: &Session, cfg: &Config) -> Result<(), String> {
+    if let Some(key) = key_file(cfg) {
+        session
+            .userauth_pubkey_file(
+                &cfg.user,
+                None,
+                &key,
+                cfg.passphrase.as_deref().filter(|p| !p.is_empty()),
+            )
+            .map_err(|e| format!("SSH Key Auth failed: {e}"))?;
+    } else if let Some(pass) = cfg.pass.as_deref() {
+        session
+            .userauth_password(&cfg.user, pass)
+            .map_err(|e| format!("SSH Password Auth failed: {e}"))?;
+    } else {
+        return Err("No SSH authentication method specified".to_string());
+    }
+    if session.authenticated() {
+        Ok(())
+    } else {
+        Err("the server did not accept the credentials".to_string())
+    }
+}
+
 pub fn on_server(path: &str) -> &str {
     if path.is_empty() {
         "."
@@ -60,23 +91,7 @@ fn connect(cfg: &Config, host: &str, port: u16) -> Result<Session2, String> {
     session
         .handshake()
         .map_err(|e| format!("SSH Handshake: {e}"))?;
-
-    if let Some(key) = cfg.key_path.as_deref().filter(|k| !k.is_empty()) {
-        session
-            .userauth_pubkey_file(
-                &cfg.user,
-                None,
-                &expand_tilde(key),
-                cfg.passphrase.as_deref(),
-            )
-            .map_err(|e| format!("SSH Key Auth failed: {e}"))?;
-    } else if let Some(pass) = cfg.pass.as_deref() {
-        session
-            .userauth_password(&cfg.user, pass)
-            .map_err(|e| format!("SSH Password Auth failed: {e}"))?;
-    } else {
-        return Err("No SSH authentication method specified".to_string());
-    }
+    authenticate(&session, cfg)?;
 
     let sftp = session.sftp().map_err(|e| format!("SFTP Init: {e}"))?;
     Ok(Session2 { session, sftp })
@@ -240,9 +255,66 @@ impl Mount {
             match work(open) {
                 Ok(value) => return Ok(value),
                 Err(reason) if attempt == 1 => return Err(reason),
-                Err(_) => self.session = None,
+                Err(reason) => {
+                    crate::note(&format!("{host}:{port}, reconnecting once after"), &reason);
+                    self.session = None;
+                }
             }
         }
         Err("the server kept refusing".to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_key(key: Option<&str>) -> Config {
+        Config {
+            host: "h".into(),
+            port: 22,
+            user: "u".into(),
+            pass: None,
+            key_path: key.map(str::to_string),
+            passphrase: None,
+            tunnel: None,
+        }
+    }
+
+    #[test]
+    fn a_key_under_the_home_folder_is_found_from_its_tilde() {
+        let home = dirs::home_dir().expect("a home folder");
+        assert_eq!(expand_tilde("~/.ssh/id_ed25519"), home.join(".ssh/id_ed25519"));
+        assert_eq!(expand_tilde("~"), home);
+    }
+
+    #[test]
+    fn a_path_without_a_leading_tilde_is_left_as_it_is() {
+        assert_eq!(expand_tilde("/etc/ssh/key"), std::path::PathBuf::from("/etc/ssh/key"));
+        assert_eq!(expand_tilde("keys/id"), std::path::PathBuf::from("keys/id"));
+        assert_eq!(expand_tilde("~someone/key"), std::path::PathBuf::from("~someone/key"));
+    }
+
+    #[test]
+    fn the_key_handed_to_ssh_never_keeps_a_tilde() {
+        let key = key_file(&with_key(Some("~/.ssh/id_ed25519"))).expect("a key");
+        assert!(!key.to_string_lossy().starts_with('~'), "{}", key.display());
+    }
+
+    #[test]
+    fn no_key_or_an_empty_one_means_signing_in_with_a_password() {
+        assert!(key_file(&with_key(None)).is_none());
+        assert!(key_file(&with_key(Some(""))).is_none());
+    }
+
+    #[test]
+    fn the_terminal_signs_in_through_the_same_code_as_the_files() {
+        let shell = include_str!("shell.rs");
+        assert!(
+            !shell.contains("userauth_pubkey_file") && !shell.contains("userauth_password"),
+            "shell.rs signs in by itself again; it must call ssh::authenticate"
+        );
+        assert!(shell.contains("crate::ssh::authenticate("));
+    }
+}
+

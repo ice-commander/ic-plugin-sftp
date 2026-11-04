@@ -162,6 +162,14 @@ impl Session2 {
         Ok(body)
     }
 
+    pub fn open(&self, path: &str) -> Result<ssh2::File, String> {
+        self.sftp.open(Path::new(path)).map_err(|e| e.to_string())
+    }
+
+    pub fn create(&self, path: &str) -> Result<ssh2::File, String> {
+        self.sftp.create(Path::new(path)).map_err(|e| e.to_string())
+    }
+
     pub fn write(&self, path: &str, bytes: &[u8]) -> Result<(), String> {
         let mut file = self
             .sftp

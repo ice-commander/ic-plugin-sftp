@@ -202,6 +202,91 @@ fn reported(handle: IcFsHandle, op: &str, outcome: Option<Result<(), String>>) -
     }
 }
 
+struct Streaming {
+    file: ssh2::File,
+    owner: IcFsHandle,
+}
+
+pub extern "C" fn stream_open(
+    handle: IcFsHandle,
+    path: *const c_char,
+    mode: u32,
+) -> ic_plugin_api::IcFsStream {
+    let path = wanted(path);
+    let opened = held(handle, |mounted| {
+        mounted.mount.with(|session| {
+            if mode == ic_plugin_api::IC_OPEN_READ {
+                session.open(&path)
+            } else {
+                session.create(&path)
+            }
+        })
+    });
+    match opened {
+        Some(Ok(file)) => Box::into_raw(Box::new(Streaming {
+            file,
+            owner: handle,
+        })) as ic_plugin_api::IcFsStream,
+        Some(Err(reason)) => {
+            let _ = held(handle, |mounted| mounted.remember(reason));
+            std::ptr::null_mut()
+        }
+        None => std::ptr::null_mut(),
+    }
+}
+
+pub extern "C" fn stream_read(
+    stream: ic_plugin_api::IcFsStream,
+    into: *mut u8,
+    len: u64,
+) -> i64 {
+    if stream.is_null() || into.is_null() {
+        return -1;
+    }
+    let open = unsafe { &mut *(stream as *mut Streaming) };
+    let room = unsafe { std::slice::from_raw_parts_mut(into, len as usize) };
+    match std::io::Read::read(&mut open.file, room) {
+        Ok(got) => got as i64,
+        Err(e) => {
+            let _ = held(open.owner, |mounted| mounted.remember(e.to_string()));
+            -1
+        }
+    }
+}
+
+pub extern "C" fn stream_write(
+    stream: ic_plugin_api::IcFsStream,
+    from: *const u8,
+    len: u64,
+) -> i64 {
+    if stream.is_null() || from.is_null() {
+        return -1;
+    }
+    let open = unsafe { &mut *(stream as *mut Streaming) };
+    let body = unsafe { std::slice::from_raw_parts(from, len as usize) };
+    match std::io::Write::write(&mut open.file, body) {
+        Ok(took) => took as i64,
+        Err(e) => {
+            let _ = held(open.owner, |mounted| mounted.remember(e.to_string()));
+            -1
+        }
+    }
+}
+
+pub extern "C" fn stream_close(stream: ic_plugin_api::IcFsStream) -> c_int {
+    if stream.is_null() {
+        return IC_ERR_INIT_FAILED;
+    }
+    let mut open = unsafe { Box::from_raw(stream as *mut Streaming) };
+    match std::io::Write::flush(&mut open.file) {
+        Ok(()) => IC_OK,
+        Err(e) => {
+            let _ = held(open.owner, |mounted| mounted.remember(e.to_string()));
+            IC_ERR_INIT_FAILED
+        }
+    }
+}
+
 pub extern "C" fn write(
     handle: IcFsHandle,
     path: *const c_char,
@@ -356,6 +441,12 @@ pub fn vtable() -> IcFsVTable {
         action_state: None,
         cell_clicked: None,
         set_permissions: Some(set_permissions),
+        stream_open: Some(stream_open),
+        stream_read: Some(stream_read),
+        stream_write: Some(stream_write),
+        stream_close: Some(stream_close),
+        copy_within: None,
+        on_disk: None,
     }
 }
 
@@ -831,6 +922,73 @@ mod tests {
             assert!(said.contains(&marker), "opened at {cwd}: {said}");
         }
         close(handle);
+    }
+
+    fn streams_a_file_it_wrote(through_tunnel: bool) {
+        let home = need("IC_SFTP_E2E_HOME");
+        let home = home.trim_end_matches('/');
+        let path = format!("{home}/ic-sftp-streaming-{}.bin", std::process::id());
+        let handle = opened(&e2e_settings(through_tunnel).to_string());
+
+        let body = vec![b'x'; 3 * 1024 * 1024];
+
+        let out = stream_open(handle, at(&path).as_ptr(), ic_plugin_api::IC_OPEN_WRITE);
+        assert!(!out.is_null(), "opening to write: {}", failure_of(handle));
+        let mut sent = 0usize;
+        let mut writes = 0;
+        while sent < body.len() {
+            let took = stream_write(
+                out,
+                body[sent..].as_ptr(),
+                (body.len() - sent) as u64,
+            );
+            assert!(took > 0, "writing at {sent}: {}", failure_of(handle));
+            sent += took as usize;
+            writes += 1;
+        }
+        assert_eq!(stream_close(out), IC_OK, "{}", failure_of(handle));
+        assert_eq!(sent, body.len());
+
+        let input = stream_open(handle, at(&path).as_ptr(), ic_plugin_api::IC_OPEN_READ);
+        assert!(!input.is_null(), "opening to read: {}", failure_of(handle));
+        let mut got = Vec::new();
+        let mut window = vec![0u8; 256 * 1024];
+        let mut positions = Vec::new();
+        loop {
+            let n = stream_read(input, window.as_mut_ptr(), window.len() as u64);
+            assert!(n >= 0, "reading at {}: {}", got.len(), failure_of(handle));
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&window[..n as usize]);
+            positions.push(got.len());
+        }
+        assert_eq!(stream_close(input), IC_OK);
+
+        assert_eq!(got, body, "every byte comes back as it was written");
+        assert!(
+            positions.len() > 1,
+            "a file this size is seen arriving, not handed over at the end: {positions:?}"
+        );
+        for pair in positions.windows(2) {
+            assert!(pair[1] > pair[0], "the position only grows: {positions:?}");
+        }
+        assert!(writes > 1, "and it is fed in as it goes, not in one lump");
+
+        assert_eq!(remove(handle, at(&path).as_ptr()), IC_OK);
+        close(handle);
+    }
+
+    #[test]
+    #[ignore = "needs IC_SFTP_E2E_HOME on a writable server"]
+    fn a_direct_mount_streams_a_file_and_shows_how_far_it_has_got() {
+        streams_a_file_it_wrote(false);
+    }
+
+    #[test]
+    #[ignore = "needs IC_SFTP_E2E_HOME on a writable server, behind a jump host"]
+    fn a_tunnelled_mount_streams_a_file_and_shows_how_far_it_has_got() {
+        streams_a_file_it_wrote(true);
     }
 
     #[test]
